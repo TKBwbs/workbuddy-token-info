@@ -70,6 +70,14 @@
 - Windows 下若 8787 端口被占用，用 `--port` 换一个即可。
 - 明细表单次最多渲染 3000 行以保证流畅，完整数据请用 CSV 导出。
 
+## 配套工具
+
+看清钱花在哪之后，怎么把它省下来？
+
+- **[workbuddy-orchestrator-worker](https://github.com/TKBwbs/workbuddy-orchestrator-worker)** —— 一个 WorkBuddy 技能，让强模型规划验收、弱模型并行执行，把 AI 使用成本压到 1/17。
+
+先用本看板定位消耗大头，再用那个技能把"探索类"的活下沉给便宜模型，两步配合。
+
 ## 目录
 
 ```
