@@ -6,7 +6,8 @@
 
 ## 特性
 
-- **启动即监控全机任务**：扫描 `~/.workbuddy/projects/*/*.jsonl`，之后增量读取，页面每 1.8 秒刷新；任务运行中曲线自己往右长。
+- **启动即监控全机任务**：扫描 `~/.workbuddy/projects/*/*.jsonl` 与各会话下的 `subagents/*.jsonl`，之后增量读取，页面每 1.8 秒刷新；任务运行中曲线自己往右长。
+- **子 Agent 消耗一并计入**：Explore / general-purpose 等子 Agent 的会话文件会合并到所属任务，顶部单独标注「子 Agent N 个 · X 步 · Y 分」，明细表可按来源筛选，不再漏算这部分花销。
 - **左侧任务列表**：按最近活跃 / Token 总量 / 积分 / 轮次排序，支持搜索，实时活跃指示灯。
 - **四条曲线可切**：
   - 累计 Token（输入、输出两条）
@@ -16,9 +17,9 @@
 - **按轮次分段**：图上按你发消息的轮次画色带与分隔线，悬停出十字线和明细。
 - **明细区「逐轮 / 逐步骤」切换**：
   - 逐轮：每行一轮对话，含总 token、工具调用次数、积分、耗时；
-  - 逐步骤：每行一次模型调用，含时间、所属轮次、工具名、参数摘要、模型、输入/缓存/输出 token、该步积分、与上一步的间隔。
+  - 逐步骤：每行一次模型调用，含时间、所属轮次、来源（主会话 / 子 Agent）、工具名、参数摘要、模型、输入/缓存/输出 token、该步积分、与上一步的间隔。
 - **表头排序**：点列名排序，三态循环（降序 → 升序 → 原始顺序），带 ▲/▼ 指示。
-- **「工具 / 动作 × 消耗」可视化**：左侧按工具聚合（点击某工具即筛选明细），右侧按轮次堆叠展示各工具消耗，口径可切 积分 / Token / 次数。
+- **「工具 / 动作 × 消耗」可视化**：左侧按工具聚合（点击某工具即筛选明细），左上角可切「按工具 / 按来源」查看各 Agent 的消耗分布；右侧按轮次堆叠展示各工具消耗，口径可切 积分 / Token / 次数。
 - **CSV 导出**：跟随当前视图与排序。
 - **深链**：`/#steps` `/#credit` `#hit` 直达视图；`?task=<会话ID>` 直达某个任务。
 
@@ -51,7 +52,9 @@
 
 1. `~/.workbuddy/projects/<工作区>/<sessionId>.jsonl`
    每次模型调用的条目带 `providerData.rawUsage`，含 `prompt_tokens`、`completion_tokens`、缓存命中 token 与 `credit`，并附 `conversationRequestId`、模型名、时间戳、工具名。
-2. `~/.workbuddy/workbuddy.db`（SQLite，只读打开）
+2. `~/.workbuddy/projects/<工作区>/<sessionId>/subagents/agent-*.jsonl`
+   子 Agent 的独立会话，结构与主会话一致，`providerData.agent` 记录 Agent 类型（如 `Explore`）。这些记录与主会话文件不重叠，会并入所属任务统计；子 Agent 用户消息的 `_meta.baggage` 带的是父请求 id，因此按 `providerData.conversationRequestId` 归属，避免串轮。
+3. `~/.workbuddy/workbuddy.db`（SQLite，只读打开）
    `sessions` 提供任务标题、工作目录、模型；`session_usage.credit_json` 提供按请求归档的积分。
 
 按 `(messageId, stepSeq)` 去重，避免重复计费；积分以数据库归档为准，缺失时回退到 transcript 累计。抽样比对两者合计多数任务完全一致，个别差异来自图片生成等非模型步骤，取较大值补齐。
@@ -74,4 +77,5 @@ wb_usage_server.py   单文件本体：本地 HTTP 服务 + 内嵌页面（仅�
 index.html           页面源码（存在时优先加载，便于改样式）
 start.bat            Windows 启动脚本
 start.sh             macOS / Linux 启动脚本
+PROMPT.md            让 WorkBuddy 自己生成同款看板的提示词
 ```

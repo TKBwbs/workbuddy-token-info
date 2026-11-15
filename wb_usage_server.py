@@ -40,12 +40,13 @@ SR_RE = re.compile(r"<system-reminder[\s\S]*?</system-reminder>", re.I)
 # ----------------------------------------------------------------------------
 
 class FileState(object):
-    __slots__ = ("offset", "buf", "sid")
+    __slots__ = ("offset", "buf", "sid", "agent")
 
-    def __init__(self, sid):
+    def __init__(self, sid, agent=None):
         self.offset = 0
         self.buf = b""
         self.sid = sid
+        self.agent = agent
 
 
 class Store(object):
@@ -88,6 +89,13 @@ class Store(object):
                 "lastTs": None,
                 "ver": 0,
                 "seen": set(),
+                # 子 Agent：文件级 key -> 聚合；agentNames: key -> 展示名（Explore / general-purpose 等）
+                "agents": {},
+                "agentNames": {},
+                "subSteps": 0,
+                "subCredit": 0.0,
+                "subTin": 0,
+                "subTout": 0,
             }
             self.sessions[sid] = s
         if path and not s.get("path"):
@@ -102,10 +110,17 @@ class Store(object):
         s["credit"] = 0.0
         s["firstTs"] = s["lastTs"] = None
         s["seen"] = set()
+        s["agents"] = {}
+        s["agentNames"] = {}
+        s["subSteps"] = 0
+        s["subCredit"] = 0.0
+        s["subTin"] = 0
+        s["subTout"] = 0
 
     # ---------------- 文件增量读取 ----------------
 
-    def ingest(self, path, sid=None):
+    def ingest(self, path, sid=None, agent=None):
+        """agent 为子 Agent 文件标识（文件名去扩展名）；其用量并入父会话 sid。"""
         try:
             st = os.stat(path)
         except OSError:
@@ -117,11 +132,19 @@ class Store(object):
         fs = self.files.get(path)
         s = self._session(sid, path)
         if fs is None:
-            fs = self.files[path] = FileState(sid)
+            fs = self.files[path] = FileState(sid, agent)
+        elif agent and not fs.agent:
+            fs.agent = agent
         if st.st_size < fs.offset:
+            # 文件被截断/重写：整会话（含其子 Agent 文件）一起重读，靠去重键防止重复计数
             fs.offset = 0
             fs.buf = b""
             self._reset(s)
+            for f2 in self.files.values():
+                if f2 is not fs and f2.sid == sid:
+                    f2.offset = 0
+                    f2.buf = b""
+            return False
         if st.st_size == fs.offset:
             return False
 
@@ -138,7 +161,7 @@ class Store(object):
         for raw in parts:
             if not raw.strip():
                 continue
-            if self._line(raw, s):
+            if self._line(raw, s, agent or ""):
                 changed = True
         if changed:
             s["ver"] += 1
@@ -146,7 +169,7 @@ class Store(object):
             self.last_change = time.time()
         return changed
 
-    def _line(self, raw, s):
+    def _line(self, raw, s, agent=""):
         try:
             line = raw.decode("utf-8", "replace")
         except Exception:
@@ -168,12 +191,19 @@ class Store(object):
 
         t = o.get("type")
         if t == "ai-title" and o.get("aiTitle"):
-            s["title"] = str(o["aiTitle"])[:120]
+            if not agent:                       # 子 Agent 的标题不能覆盖父会话标题
+                s["title"] = str(o["aiTitle"])[:120]
             return True
 
         if t == "message" and o.get("role") == "user":
             txt, synthetic = self._user_text(o)
-            rid = self._rid(o)
+            rid = self._rid(o, bool(agent))
+            if agent:
+                # 子 Agent 的用户消息里 baggage 带的是父会话 requestId，必须优先用自身的
+                if not rid:
+                    rid = "u%d" % (len(s["order"]) + 1)
+                rid = "#%s#%s" % (agent, rid)
+                self._note_agent(s, agent, (o.get("providerData") or {}).get("agent"))
             ts = o.get("timestamp")
             if rid:
                 turn = s["turns"].get(rid)
@@ -190,6 +220,7 @@ class Store(object):
                         "cout": 0,
                         "ccache": 0,
                         "credit": 0.0,
+                        "ag": s["agentNames"].get(agent, ""),
                     }
                     s["turns"][rid] = turn
                     s["order"].append(rid)
@@ -205,13 +236,16 @@ class Store(object):
         if not isinstance(ru, dict) or o.get("role") == "user":
             return False
 
-        key = (pd.get("messageId") or "", pd.get("stepSeq"))
-        if key[0] and key in s["seen"]:
+        key = (agent, pd.get("messageId") or "", pd.get("stepSeq"))
+        if key[1] and key in s["seen"]:
             return False
-        if key[0]:
+        if key[1]:
             s["seen"].add(key)
 
         rid = pd.get("conversationRequestId") or ""
+        if agent:
+            rid = "#%s#%s" % (agent, rid or "x")
+            self._note_agent(s, agent, pd.get("agent"))
         ts = o.get("timestamp") or int(time.time() * 1000)
         pin = self._num(ru.get("prompt_tokens"))
         pout = self._num(ru.get("completion_tokens"))
@@ -248,6 +282,7 @@ class Store(object):
                 "cout": 0,
                 "ccache": 0,
                 "credit": 0.0,
+                "ag": s["agentNames"].get(agent, ""),
             }
             s["turns"][rid] = turn
             s["order"].append(rid)
@@ -262,6 +297,7 @@ class Store(object):
                 "m": model,
                 "tool": tool or "",
                 "d": desc,
+                "ag": s["agentNames"].get(agent, ""),
             }
         )
         turn["cin"] += pin
@@ -277,12 +313,39 @@ class Store(object):
         s["tout"] += pout
         s["tcache"] += cache
         s["credit"] += credit
+        if agent:
+            a = s["agents"].get(agent)
+            if a is None:
+                a = s["agents"][agent] = {
+                    "key": agent,
+                    "name": s["agentNames"].get(agent, ""),
+                    "steps": 0,
+                    "credit": 0.0,
+                    "tin": 0,
+                    "tout": 0,
+                }
+            a["steps"] += 1
+            a["credit"] += credit
+            a["tin"] += int(pin)
+            a["tout"] += int(pout)
+            s["subSteps"] += 1
+            s["subCredit"] += credit
+            s["subTin"] += int(pin)
+            s["subTout"] += int(pout)
         if model:
             s["models"][model] = s["models"].get(model, 0) + 1
             s["model"] = model
         s["firstTs"] = int(ts) if s["firstTs"] is None else min(s["firstTs"], int(ts))
         s["lastTs"] = int(ts) if s["lastTs"] is None else max(s["lastTs"], int(ts))
         return True
+
+    @staticmethod
+    def _note_agent(s, key, name):
+        if name:
+            s["agentNames"][key] = str(name)[:24]
+            a = s["agents"].get(key)
+            if a is not None and not a.get("name"):
+                a["name"] = s["agentNames"][key]
 
     @staticmethod
     def _num(v):
@@ -292,13 +355,17 @@ class Store(object):
             return 0.0
 
     @staticmethod
-    def _rid(o):
+    def _rid(o, prefer_pd=False):
+        pd = o.get("providerData") or {}
+        if prefer_pd:
+            r = pd.get("conversationRequestId")
+            if r:
+                return r
         meta = o.get("_meta") or {}
         bag = meta.get("baggage") or ""
         m = RID_RE.search(bag)
         if m:
             return m.group(1)
-        pd = o.get("providerData") or {}
         return pd.get("conversationRequestId") or ""
 
     @staticmethod
@@ -405,6 +472,8 @@ class Store(object):
     def session_summary(self, s):
         total = s["tin"] + s["tout"]
         hit = (s["tcache"] / s["tin"]) if s["tin"] else 0.0
+        main_turns = sum(1 for r in s["order"] if not s["turns"][r].get("ag"))
+        sub_turns = len(s["order"]) - main_turns
         return {
             "id": s["id"],
             "title": s["title"] or "（未命名任务）",
@@ -416,7 +485,7 @@ class Store(object):
             "createdAt": s.get("createdAt"),
             "firstTs": s["firstTs"],
             "lastTs": s["lastTs"],
-            "turns": len(s["order"]),
+            "turns": main_turns,
             "steps": s["steps"],
             "tin": int(s["tin"]),
             "tout": int(s["tout"]),
@@ -427,6 +496,27 @@ class Store(object):
             "ctxUsed": s.get("ctxUsed"),
             "ctxSize": s.get("ctxSize"),
             "ver": s["ver"],
+            "subs": {
+                "steps": s["subSteps"],
+                "turns": sub_turns,
+                "credit": round(s["subCredit"], 2),
+                "tin": int(s["subTin"]),
+                "tout": int(s["subTout"]),
+                "agents": sorted(
+                    [
+                        {
+                            "key": a["key"],
+                            "name": a.get("name") or "子 Agent",
+                            "steps": a["steps"],
+                            "credit": round(a["credit"], 2),
+                            "tin": a["tin"],
+                            "tout": a["tout"],
+                        }
+                        for a in s["agents"].values()
+                    ],
+                    key=lambda x: (-x["credit"], -x["steps"]),
+                ),
+            },
         }
 
     def detail(self, sid):
@@ -434,7 +524,7 @@ class Store(object):
         if not s:
             return None
         turns = []
-        for rid in s["order"]:
+        for rid in sorted(s["order"], key=lambda r: (s["turns"][r]["ts"] or 0)):
             t = s["turns"][rid]
             steps = sorted(t["steps"], key=lambda x: x["t"])
             if not steps and not t["text"]:
@@ -452,6 +542,7 @@ class Store(object):
                     "tout": int(t["cout"]),
                     "tcache": int(t["ccache"]),
                     "credit": round(t["credit"], 2),
+                    "ag": t.get("ag") or "",
                 }
             )
         return {"ver": s["ver"], "turns": turns, "summary": self.session_summary(s)}
@@ -499,20 +590,41 @@ class Watcher(threading.Thread):
         self.stop_flag = False
 
     def _files(self):
-        pats = [os.path.join(self.store.projects, "*", "*.jsonl")]
+        proj = self.store.projects
+        pats = [
+            os.path.join(proj, "*", "*.jsonl"),
+            # 子 Agent 会话：projects/<项目>/<会话id>/subagents/agent-*.jsonl（可能再嵌套）
+            os.path.join(proj, "*", "**", "subagents", "*.jsonl"),
+        ]
         out = []
+        seen = set()
         cutoff = time.time() - self.days * 86400 if self.days else 0
         for pat in pats:
-            for p in glob.glob(pat):
+            for p in glob.glob(pat, recursive=True):
+                if p in seen:
+                    continue
                 if p.endswith(".file-rollback.ndjson"):
+                    continue
+                if "%stool-results%s" % (os.sep, os.sep) in p:
                     continue
                 try:
                     if cutoff and os.stat(p).st_mtime < cutoff:
                         continue
                 except OSError:
                     continue
+                seen.add(p)
                 out.append(p)
         return out
+
+    def where(self, path):
+        """返回 (归属会话 id, 子 Agent 文件标识)。主会话文件返回 (None, None)。"""
+        rel = os.path.relpath(path, self.store.projects).replace("\\", "/").split("/")
+        if "subagents" not in rel or len(rel) < 2:
+            return None, None
+        sid = rel[1]
+        if sid.endswith(".jsonl"):
+            sid = sid[:-6]
+        return sid, os.path.splitext(rel[-1])[0]
 
     def run(self):
         st = self.store
@@ -520,8 +632,9 @@ class Watcher(threading.Thread):
         files = self._files()
         st.scan_total = len(files)
         for i, p in enumerate(files):
+            sid, ag = self.where(p)
             with st.lock:
-                st.ingest(p)
+                st.ingest(p, sid, ag)
             st.scan_done = i + 1
         with st.lock:
             st.ready = True
@@ -537,7 +650,8 @@ class Watcher(threading.Thread):
                         continue
                     fs = st.files.get(p)
                     if fs is None or st_size != fs.offset:
-                        st.ingest(p)
+                        sid, ag = self.where(p)
+                        st.ingest(p, sid, ag)
                 if int(time.time()) % 60 == 0:
                     st.load_db()
 
@@ -723,6 +837,7 @@ main{
 .sgrid{position:absolute;left:0;right:54px;top:0;bottom:15px;pointer-events:none}
 .sgrid i{position:absolute;left:0;right:0;border-top:1px dashed #e9edf4}
 .sgrid i span{position:absolute;right:-50px;top:-5px;font-size:9px;color:#aab3c2;white-space:nowrap}
+.sgrid i.top span{top:3px}
 .stack{display:flex;align-items:flex-end;gap:2px;flex:1;min-height:0;border-bottom:1px solid var(--line);padding-bottom:1px;padding-right:54px}
 .scol{flex:1 1 0;min-width:2px;height:100%;display:flex;flex-direction:column;justify-content:flex-end;border-radius:3px 3px 0 0}
 .scol:hover{background:#eef3ff}
@@ -777,6 +892,24 @@ tbody td:first-child{padding-left:16px}
   font-family:ui-monospace,Menlo,Consolas,monospace;font-size:10.5px;
   background:#f3f6fc;border:1px solid #e1e9f7;color:#2f558c;
   padding:1px 6px;border-radius:5px;white-space:nowrap;
+}
+.agtag{
+  font-size:10px;padding:1px 6px;border-radius:5px;white-space:nowrap;
+  background:#f1f0ff;border:1px solid #ddd9fb;color:#5b46c9;
+  font-family:ui-monospace,Menlo,Consolas,monospace;
+}
+.agtag.main{background:#f3f5f9;border-color:var(--line2);color:var(--muted)}
+.mini{
+  display:inline-flex;gap:2px;background:#f3f5f9;padding:2px;border-radius:7px;vertical-align:1px;margin-left:4px;
+}
+.mini a{
+  font-size:10.5px;padding:1px 7px;border-radius:5px;color:var(--fg2);cursor:pointer;user-select:none;
+}
+.mini a.on{background:#fff;color:var(--fg);font-weight:640;box-shadow:0 1px 2px rgba(16,24,40,.08)}
+.chip.sa{border-color:#ddd9fb;background:#f5f3ff;color:#5b46c9}
+.item-nums .sa{
+  color:#5b46c9;background:#f1f0ff;border:1px solid #ddd9fb;border-radius:5px;
+  padding:0 4px;font-size:10px;line-height:15px;
 }
 .muted{color:var(--muted)}
 .foot{color:var(--muted);font-size:11px;padding:0;display:flex;gap:12px;flex-wrap:wrap}
@@ -850,7 +983,7 @@ tbody td:first-child{padding-left:16px}
       </div>
       <div class="viz-body">
         <div class="viz-pane">
-          <div class="viz-cap">按工具聚合 <b>（点击只看该工具）</b></div>
+          <div class="viz-cap">按工具聚合 <span class="mini" id="bytabs"><a data-by="tool" class="on">按工具</a><a data-by="agent">按来源</a></span> <b>（点击只看该项）</b></div>
           <div class="tstats" id="tstats"></div>
         </div>
         <div class="viz-pane">
@@ -947,6 +1080,8 @@ var vizMetric = "credit";
 var sortTurn = { k: null, d: -1 };
 var sortStep = { k: null, d: -1 };
 var toolFilter = null;   // 在"工具 × 消耗"里点某个工具 = 只看该工具的步骤
+var srcFilter = null;    // 按来源筛选：null=全部，""=主会话，其他=子 Agent 名
+var vizBy = "tool";      // tool | agent
 var paused = false;
 var reqSeq = 0, appliedSeq = 0, inFlight = false;
 var lastKey = "";
@@ -1055,7 +1190,7 @@ function renderList(){
     return (b.lastTs||0) - (a.lastTs||0);
   });
   var sig = arr.map(function(x){
-    return [x.id, x.total, x.credit, x.turns, x.lastTs, x.title].join(":");
+    return [x.id, x.total, x.credit, x.turns, x.lastTs, x.title, (x.subs && x.subs.steps) || 0].join(":");
   }).join("|") + "#" + state.selected + "#" + sort + "#" + q;
   if (sig === lastListKey) return;
   lastListKey = sig;
@@ -1073,7 +1208,9 @@ function renderList(){
         '<span>·</span><span>' + dt(x.lastTs) + '</span></div>' +
       '<div class="item-nums"><span><b>' + kfmt(x.total) + '</b> tok</span>' +
         '<span><b>' + (x.credit||0).toFixed(2) + '</b> 分</span>' +
-        '<span>' + x.turns + ' 轮</span></div>' +
+        '<span>' + x.turns + ' 轮</span>' +
+        (x.subs && x.subs.steps ? '<span class="sa" title="含 ' + x.subs.agents.length + ' 个子 Agent、' +
+          x.subs.steps + ' 步">↳' + x.subs.agents.length + '</span>' : "") + '</div>' +
       '<div class="spark"><i style="width:' + Math.max(3, Math.round(x.total/max*100)) + '%"></i></div>' +
     '</div>';
   }).join("");
@@ -1103,7 +1240,14 @@ function renderHero(){
   if (sum.model) chips.push('<span class="chip m">' + esc(sum.model) + '</span>');
   if (sum.status) chips.push('<span class="chip">' + esc(sum.status) + '</span>');
   if (sum.ctxSize) chips.push('<span class="chip">上下文 ' + kfmt(sum.ctxUsed||0) + " / " + kfmt(sum.ctxSize) + '</span>');
-  chips.push('<span class="chip">' + sum.steps + ' 次模型调用</span>');
+  var sub = sum.subs || null;
+  var hasSub = !!(sub && sub.steps);
+  chips.push('<span class="chip">' + sum.steps + ' 次模型调用' + (hasSub ? "（含子 Agent）" : "") + '</span>');
+  if (hasSub){
+    chips.push('<span class="chip sa" title="子 Agent 的会话文件在 projects/&lt;项目&gt;/&lt;会话&gt;/subagents/ 下，已合并计入本任务">' +
+      '子 Agent ' + sub.agents.length + ' 个 · ' + sub.steps + ' 步 · ' + sub.credit.toFixed(2) + ' 分 · ' +
+      kfmt(sub.tin + sub.tout) + ' tok</span>');
+  }
   if (sum.lastTs) chips.push('<span class="chip">最近 ' + dt(sum.lastTs) + '</span>');
 
   head.innerHTML =
@@ -1144,6 +1288,7 @@ function getFlat(){
       flat.push({
         seq: seq, t: st.t, i: st.i, o: st.o, c: st.c, cr: st.cr || 0,
         m: st.m || "", tool: st.tool || "", d: st.d || "", ti: ti, turnNo: ti + 1,
+        ag: st.ag || "",
         act: st.tool || "模型输出",
         gap: 0
       });
@@ -1371,10 +1516,11 @@ function vizFmt(v){
 }
 var vizColors = {};
 
-function buildToolStats(flat){
+function buildToolStats(flat, mode){
+  var byAgent = (mode === "agent");
   var map = {};
   flat.forEach(function(st){
-    var name = st.act;
+    var name = byAgent ? (st.ag || "主会话") : st.act;
     var o = map[name] || (map[name] = { name: name, credit: 0, tokens: 0, count: 0, color: "" });
     o.credit += st.cr;
     o.tokens += st.i + st.o;
@@ -1385,7 +1531,9 @@ function buildToolStats(flat){
   arr.sort(function(a,b){ return b[key] - a[key]; });
   vizColors = {};
   arr.forEach(function(o, i){
-    o.color = o.name === "模型输出" ? "#94a3b8" : PALETTE[i % PALETTE.length];
+    o.color = (!byAgent && o.name === "模型输出") ? "#94a3b8"
+            : (byAgent && o.name === "主会话") ? "#94a3b8"
+            : PALETTE[i % PALETTE.length];
     vizColors[o.name] = o.color;
   });
   return arr;
@@ -1402,7 +1550,10 @@ function renderViz(){
     $("stackcap").textContent = "";
     return;
   }
-  var stats = buildToolStats(flat);
+  var toolStats = buildToolStats(flat, "tool");
+  var toolColors = vizColors;
+  var stats = vizBy === "agent" ? buildToolStats(flat, "agent") : toolStats;
+  var byAgent = vizBy === "agent";
   var key = vizMetric === "count" ? "count" : vizMetric === "tokens" ? "tokens" : "credit";
   var maxV = stats.length ? stats[0][key] : 1;
   var totalAll = stats.reduce(function(a,b){ return a + b[key]; }, 0);
@@ -1411,8 +1562,13 @@ function renderViz(){
   box.innerHTML = stats.slice(0, TOPN).map(function(o){
     var v = o[key];
     var share = totalAll ? (v / totalAll * 100) : 0;
-    return '<div class="trow' + (toolFilter === o.name ? " on" : "") + '" data-tool="' + esc(o.name) +
-      '" data-tip="' + esc(o.name + " · " + vizFmt(v) + " · 占 " + share.toFixed(1) + "% · 共 " + o.count +
+    var on = byAgent ? (srcFilter === (o.name === "主会话" ? "" : o.name))
+                     : (toolFilter === o.name);
+    var attr = byAgent
+      ? 'data-src="' + esc(o.name === "主会话" ? "" : o.name) + '"'
+      : 'data-tool="' + esc(o.name) + '"';
+    return '<div class="trow' + (on ? " on" : "") + '"' + attr +
+      ' data-tip="' + esc(o.name + " · " + vizFmt(v) + " · 占 " + share.toFixed(1) + "% · 共 " + o.count +
       " 步 · 点击只看它") + '">' +
       '<span class="tdot" style="background:' + o.color + '"></span>' +
       '<span class="tname" title="' + esc(o.name) + '">' + esc(o.name) + '</span>' +
@@ -1425,7 +1581,7 @@ function renderViz(){
 
   /* 按轮次堆叠 */
   var d = state.detail;
-  var topNames = stats.slice(0, 8).map(function(o){ return o.name; });
+  var topNames = toolStats.slice(0, 8).map(function(o){ return o.name; });
   var turns = d.turns.map(function(t){
     var segs = {};
     var tot = 0;
@@ -1440,7 +1596,7 @@ function renderViz(){
   var maxTurn = Math.max.apply(null, turns.map(function(x){ return x.tot; }).concat([1]));
   var colorOf = function(nm){
     if (nm === "其他") return "#cbd5e1";
-    return vizColors[nm] || "#94a3b8";
+    return toolColors[nm] || "#94a3b8";
   };
   stack.innerHTML = turns.map(function(tu, i){
     var h = tu.tot > 0 ? Math.max(1.2, tu.tot / maxTurn * 100) : 0;
@@ -1455,7 +1611,8 @@ function renderViz(){
   }).join("");
 
   $("sgrid").innerHTML = [1, 0.5].map(function(f){
-    return '<i style="bottom:' + (f * 100).toFixed(0) + '%"><span>' + vizFmt(maxTurn * f) + '</span></i>';
+    return '<i class="' + (f === 1 ? "top" : "") + '" style="bottom:' + (f * 100).toFixed(0) + '%"><span>' +
+      vizFmt(maxTurn * f) + '</span></i>';
   }).join("");
 
   var showLab = turns.length <= 40;
@@ -1464,7 +1621,7 @@ function renderViz(){
   }).join("");
 
   var total = stats.reduce(function(a,b){ return a + b[key]; }, 0);
-  $("vizhint").textContent = stats.length + " 种动作 · " + flat.length + " 步 · 合计 " +
+  $("vizhint").textContent = stats.length + (byAgent ? " 个来源" : " 种动作") + " · " + flat.length + " 步 · 合计 " +
     (vizMetric === "count" ? Math.round(total) + " 次" : vizMetric === "tokens" ? kfmt(total) + " tok" : total.toFixed(2) + " 积分");
   $("stackcap").textContent = "（单轮最高 " + vizFmt(maxTurn) + "）";
 }
@@ -1547,7 +1704,7 @@ function renderTable(){
   var thead = $("thead"), tbody = $("tbody"), table = $("dt");
   if (detailSid !== wantSid || !state.detail || !state.detail.turns){
     thead.innerHTML = "";
-    tbody.innerHTML = '<tr><td colspan="12" style="text-align:center;color:#8b94a5;padding:22px">正在载入该任务的调用记录…</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="13" style="text-align:center;color:#8b94a5;padding:22px">正在载入该任务的调用记录…</td></tr>';
     $("turnhint").textContent = "";
     return;
   }
@@ -1556,13 +1713,16 @@ function renderTable(){
     table.style.minWidth = "";
     renderTurnRows(d, thead, tbody);
   } else {
-    table.style.minWidth = "1040px";
+    table.style.minWidth = "1140px";
     renderStepRows(d, thead, tbody);
   }
   var fb = $("filterbtn");
-  if (toolFilter){
+  var parts = [];
+  if (toolFilter) parts.push("工具 " + toolFilter);
+  if (srcFilter !== null) parts.push("来源 " + (srcFilter || "主会话"));
+  if (parts.length){
     fb.style.display = "";
-    fb.textContent = "只看 " + toolFilter + " ✕";
+    fb.textContent = "只看 " + parts.join(" · ") + " ✕";
   } else {
     fb.style.display = "none";
   }
@@ -1573,6 +1733,7 @@ function renderTable(){
 function renderTurnRows(d, thead, tbody){
   thead.innerHTML = '<tr>' +
     thCell("idx", "轮次", { l:true, w:56 }) +
+    thCell("src", "来源", { l:true, w:100 }) +
     thCell("text", "你的输入", { l:true }) +
     thCell("ts", "时间", { w:84 }) +
     thCell("steps", "步骤", { w:58 }) +
@@ -1587,11 +1748,13 @@ function renderTurnRows(d, thead, tbody){
     return {
       idx: i + 1, text: t.text || "", ts: t.ts, steps: t.steps.length, tools: t.tools,
       tin: t.tin, tcache: t.tcache, tout: t.tout, credit: t.credit || 0,
-      dur: (t.endTs || t.ts) - t.ts, raw: t
+      dur: (t.endTs || t.ts) - t.ts, ag: t.ag || "", raw: t
     };
   });
+  if (srcFilter !== null) rows = rows.filter(function(x){ return x.ag === srcFilter; });
   rows = sortArr(rows, {
-    idx: function(x){ return x.idx; }, text: function(x){ return x.text; },
+    idx: function(x){ return x.idx; }, src: function(x){ return x.ag; },
+    text: function(x){ return x.text; },
     ts: function(x){ return x.ts; }, steps: function(x){ return x.steps; },
     tools: function(x){ return x.tools; }, tin: function(x){ return x.tin; },
     tcache: function(x){ return x.tcache; }, tout: function(x){ return x.tout; },
@@ -1602,6 +1765,8 @@ function renderTurnRows(d, thead, tbody){
     var tag = x.raw.synthetic ? ' class="idx syn" title="系统压缩 / 自动续跑"' : ' class="idx"';
     return '<tr data-r="1">' +
       '<td><span' + tag + '>' + x.idx + '</span></td>' +
+      '<td class="l">' + (x.ag ? '<span class="agtag">' + esc(x.ag) + '</span>'
+                               : '<span class="agtag main">主会话</span>') + '</td>' +
       '<td class="txt" title="' + esc(x.text) + '">' + esc(x.text) + '</td>' +
       '<td class="muted">' + hhmm(x.ts) + '</td>' +
       '<td>' + x.steps + '</td>' +
@@ -1616,10 +1781,12 @@ function renderTurnRows(d, thead, tbody){
 
   var total = rows.reduce(function(a,b){ return a + b.tin + b.tout; }, 0);
   var credit = rows.reduce(function(a,b){ return a + b.credit; }, 0);
+  var subN = rows.filter(function(x){ return x.ag; }).length;
   var sp = curSort();
   var sortTxt = sp.k ? " · 已按 " + $("thead").querySelector('th[data-k="' + sp.k + '"]').textContent.replace(/[▲▼]/g,"") +
     (sp.d < 0 ? " ↓" : " ↑") + " 排序（再点一次切换）" : "";
-  $("turnhint").textContent = rows.length + " 轮 · " + kfmt(total) + " token · " + credit.toFixed(2) + " 积分" + sortTxt;
+  $("turnhint").textContent = rows.length + " 轮 · " + kfmt(total) + " token · " + credit.toFixed(2) + " 积分" +
+    (subN ? "（含 " + subN + " 轮子 Agent）" : "") + sortTxt;
 }
 
 function renderStepRows(d, thead, tbody){
@@ -1627,6 +1794,7 @@ function renderStepRows(d, thead, tbody){
     thCell("seq", "#", { l:true, w:48 }) +
     thCell("t", "时间", { w:80 }) +
     thCell("turnNo", "轮", { w:44 }) +
+    thCell("src", "来源", { l:true, w:100 }) +
     thCell("act", "工具 / 动作", { l:true, w:160 }) +
     thCell("d", "参数 / 内容", { l:true }) +
     thCell("m", "模型", { l:true, w:132 }) +
@@ -1639,9 +1807,11 @@ function renderStepRows(d, thead, tbody){
   var flat = getFlat();
   flat.forEach(function(x){ x.hitv = x.i > 0 ? x.c / x.i : 0; });
   if (toolFilter) flat = flat.filter(function(x){ return x.act === toolFilter; });
+  if (srcFilter !== null) flat = flat.filter(function(x){ return (x.ag || "") === srcFilter; });
   var rows = sortArr(flat, {
     seq: function(x){ return x.seq; }, t: function(x){ return x.t; },
-    turnNo: function(x){ return x.turnNo; }, act: function(x){ return x.act; },
+    turnNo: function(x){ return x.turnNo; }, src: function(x){ return x.ag || ""; },
+    act: function(x){ return x.act; },
     d: function(x){ return x.d; }, m: function(x){ return x.m; },
     i: function(x){ return x.i; }, hitv: function(x){ return x.hitv; },
     o: function(x){ return x.o; }, cr: function(x){ return x.cr; },
@@ -1658,6 +1828,8 @@ function renderStepRows(d, thead, tbody){
       '<td class="muted">' + st.seq + '</td>' +
       '<td class="muted">' + hhmm(st.t) + '</td>' +
       '<td class="muted">' + st.turnNo + '</td>' +
+      '<td class="l">' + (st.ag ? '<span class="agtag">' + esc(st.ag) + '</span>'
+                                : '<span class="agtag main">主会话</span>') + '</td>' +
       '<td class="l">' + act + '</td>' +
       '<td class="txt" title="' + esc(st.d) + '">' + (st.d ? esc(st.d) : '<span class="muted">—</span>') + '</td>' +
       '<td class="mono muted l mdl" title="' + esc(st.m) + '">' + esc(st.m || "—") + '</td>' +
@@ -1705,6 +1877,7 @@ function exportCsv(){
     var rows = flat.slice();
     if (sp.k){
       var g = { seq:function(x){return x.seq;}, t:function(x){return x.t;}, turnNo:function(x){return x.turnNo;},
+                src:function(x){return x.ag || "";},
                 act:function(x){return x.act;}, d:function(x){return x.d;}, m:function(x){return x.m;},
                 i:function(x){return x.i;}, hitv:function(x){return x.i?x.c/x.i:0;}, o:function(x){return x.o;},
                 cr:function(x){return x.cr;}, gap:function(x){return x.gap;} };
@@ -1715,17 +1888,17 @@ function exportCsv(){
         return ((va||0)-(vb||0)) * sp.d;
       });
     }
-    lines = ["步骤,时间,轮次,工具,参数摘要,模型,输入token,缓存命中token,输出token,积分,距上步秒"];
+    lines = ["步骤,时间,轮次,来源,工具,参数摘要,模型,输入token,缓存命中token,输出token,积分,距上步秒"];
     rows.forEach(function(st){
-      lines.push([st.seq, new Date(st.t).toLocaleString("zh-CN"), st.turnNo, st.tool || "模型输出",
+      lines.push([st.seq, new Date(st.t).toLocaleString("zh-CN"), st.turnNo, st.ag || "主会话", st.tool || "模型输出",
         '"' + (st.d||"").replace(/"/g,'""') + '"', st.m || "",
         st.i, st.c, st.o, st.cr.toFixed(3), st.gap ? Math.round(st.gap/1000) : ""].join(","));
     });
     name = "workbuddy-steps-";
   } else {
-    lines = ["轮次,时间,输入摘要,步骤数,工具调用,输入token,缓存命中token,输出token,积分,耗时秒"];
+    lines = ["轮次,来源,时间,输入摘要,步骤数,工具调用,输入token,缓存命中token,输出token,积分,耗时秒"];
     state.detail.turns.forEach(function(t, i){
-      lines.push([i+1, new Date(t.ts).toLocaleString("zh-CN"), '"' + (t.text||"").replace(/"/g,'""') + '"',
+      lines.push([i+1, t.ag || "主会话", new Date(t.ts).toLocaleString("zh-CN"), '"' + (t.text||"").replace(/"/g,'""') + '"',
         t.steps.length, t.tools, t.tin, t.tcache, t.tout, (t.credit||0).toFixed(3),
         Math.round(((t.endTs||t.ts) - t.ts)/1000)].join(","));
     });
@@ -1767,6 +1940,7 @@ function setView(v){
 }
 function clearFilter(){
   toolFilter = null;
+  srcFilter = null;
   renderViz();
   renderTable();
 }
@@ -1785,12 +1959,31 @@ Array.prototype.forEach.call($("viewtabs").querySelectorAll(".tab"), function(b)
   b.addEventListener("click", function(){ setView(b.getAttribute("data-v")); });
 });
 $("filterbtn").addEventListener("click", clearFilter);
+function setVizBy(v){
+  vizBy = v;
+  Array.prototype.forEach.call($("bytabs").querySelectorAll("a"), function(x){
+    x.classList.toggle("on", x.getAttribute("data-by") === v);
+  });
+  renderViz();
+}
+Array.prototype.forEach.call($("bytabs").querySelectorAll("a"), function(a){
+  a.addEventListener("click", function(){ setVizBy(a.getAttribute("data-by")); });
+});
 $("tstats").addEventListener("click", function(ev){
   var el = ev.target;
-  while (el && el !== this && !(el.getAttribute && el.getAttribute("data-tool") !== null)){
+  while (el && el !== this && !(el.getAttribute &&
+         (el.getAttribute("data-tool") !== null || el.getAttribute("data-src") !== null))){
     el = el.parentNode;
   }
   if (!el || el === this) return;
+  if (el.getAttribute && el.getAttribute("data-src") !== null){
+    var src = el.getAttribute("data-src");
+    srcFilter = (srcFilter === src) ? null : src;
+    if (srcFilter !== null && view !== "step") setView("step");
+    renderViz();
+    renderTable();
+    return;
+  }
   var name = el.getAttribute("data-tool");
   if (!name) return;
   toolFilter = (toolFilter === name) ? null : name;
@@ -1809,6 +2002,12 @@ window.addEventListener("resize", function(){
 (function initFromLocation(){
   var hash = (location.hash || "").replace("#", "");
   if (METRICS[hash]) metric = hash;
+  if (hash === "src"){
+    vizBy = "agent";
+    Array.prototype.forEach.call($("bytabs").querySelectorAll("a"), function(x){
+      x.classList.toggle("on", x.getAttribute("data-by") === "agent");
+    });
+  }
   if (hash === "steps"){
     view = "step";
     Array.prototype.forEach.call($("viewtabs").querySelectorAll(".tab"), function(b){
@@ -1830,6 +2029,7 @@ window.addEventListener("hashchange", function(){
   var hash = (location.hash || "").replace("#", "");
   if (METRICS[hash]) setMetric(hash);
   if (hash === "steps") setView("step");
+  if (hash === "src") setVizBy("agent");
 });
 
 fetchState(true);
